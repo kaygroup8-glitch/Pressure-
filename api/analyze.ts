@@ -1,19 +1,13 @@
-import express, { Request, Response } from "express";
-import path from "path";
-import dotenv from "dotenv";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 
-dotenv.config({ path: ".env.local" });
-dotenv.config();
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "25mb",
+    },
+  },
+};
 
-const app = express();
-const PORT = 3000;
-
-// Allow base64 screenshots up to 25MB
-app.use(express.json({ limit: "25mb" }));
-
-// Lazy initialization of Gemini client
 let aiClient: GoogleGenAI | null = null;
 function getAI(): GoogleGenAI {
   if (!aiClient) {
@@ -33,30 +27,25 @@ function getAI(): GoogleGenAI {
   return aiClient;
 }
 
-// Health check endpoint
-app.get("/api/health", (_req: Request, res: Response) => {
-  res.json({ status: "ok", service: "PRESSURE" });
-});
+export default async function handler(req: any, res: any) {
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed. Use POST." });
+  }
 
-// Analyze endpoint for screenshot images
-app.post("/api/analyze", async (req: Request, res: Response) => {
   try {
-    const { imageBase64, mimeType = "image/png", textHint } = req.body;
+    const { imageBase64, mimeType = "image/png", textHint } = req.body || {};
 
     if (!imageBase64) {
       return res.status(400).json({ error: "Missing imageBase64 in request body" });
     }
 
-    // Clean base64 string if it contains prefix
     const cleanBase64 = imageBase64.replace(/^data:image\/[a-zA-Z+]+;base64,/, "");
-
     const apiKey = process.env.GEMINI_API_KEY;
 
-    // If no API key is provided, return intelligent fallback based on textHint/sample
     if (!apiKey) {
-      console.warn("GEMINI_API_KEY is not configured. Using fallback analysis.");
+      console.warn("GEMINI_API_KEY is not configured. Returning fallback analysis.");
       const fallbackResult = getFallbackAnalysis(textHint);
-      return res.json(fallbackResult);
+      return res.status(200).json(fallbackResult);
     }
 
     const ai = getAI();
@@ -170,7 +159,6 @@ Evaluate:
     const textOutput = response.text?.trim() || "{}";
     const parsed = JSON.parse(textOutput);
 
-    // Normalize pressureLevel
     const validLevel = ["low", "medium", "high"].includes(parsed.pressureLevel?.toLowerCase())
       ? parsed.pressureLevel.toLowerCase()
       : parsed.score > 60
@@ -190,19 +178,17 @@ Evaluate:
       pauseQuestion: parsed.pauseQuestion || "Can I independently verify this request before taking action?",
     };
 
-    return res.json(normalizedResult);
+    return res.status(200).json(normalizedResult);
   } catch (error: unknown) {
-    console.error("Error analyzing message with Gemini:", error);
+    console.error("Error analyzing message with Gemini in Vercel function:", error);
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
-
-    // If quota or API key error, return a fallback so user experience is not broken
     const fallback = getFallbackAnalysis(req.body?.textHint);
-    return res.json({
+    return res.status(200).json({
       ...fallback,
       _note: "Rendered with local safety evaluator due to API limit: " + errorMessage,
     });
   }
-});
+}
 
 function getFallbackAnalysis(hint?: string) {
   const lower = (hint || "").toLowerCase();
@@ -246,7 +232,6 @@ function getFallbackAnalysis(hint?: string) {
     };
   }
 
-  // Default high-pressure example matching product specification
   return {
     pressureLevel: "high",
     score: 82,
@@ -271,26 +256,3 @@ function getFallbackAnalysis(hint?: string) {
     pauseQuestion: "Can I verify this request independently before sending anything?",
   };
 }
-
-async function startServer() {
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (_req: Request, res: Response) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`PRESSURE Server running on http://0.0.0.0:${PORT}`);
-  });
-}
-
-startServer();
