@@ -52,11 +52,16 @@ app.post("/api/analyze", async (req: Request, res: Response) => {
 
     const apiKey = process.env.GEMINI_API_KEY;
 
-    // If no API key is provided, return intelligent fallback based on textHint/sample
+    // If no API key is provided: allow preset sample hints to work, but notify for real uploads
     if (!apiKey) {
-      console.warn("GEMINI_API_KEY is not configured. Using fallback analysis.");
-      const fallbackResult = getFallbackAnalysis(textHint);
-      return res.json(fallbackResult);
+      if (textHint) {
+        console.warn("GEMINI_API_KEY not configured. Serving preset sample demonstration.");
+        const fallbackResult = getFallbackAnalysis(textHint);
+        return res.json(fallbackResult);
+      }
+      return res.status(400).json({
+        error: "GEMINI_API_KEY is not configured on the server. Please add your Gemini API key to your environment variables (or .env.local).",
+      });
     }
 
     const ai = getAI();
@@ -84,88 +89,109 @@ Evaluate:
 - Specific, safe action to verify independently before responding
 - One concise, powerful "pause question" to ask oneself before acting`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: mimeType || "image/png",
-              data: cleanBase64,
+    const CANDIDATE_MODELS = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-flash-latest"];
+    const genConfig = {
+      systemInstruction,
+      temperature: 0.2,
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          pressureLevel: {
+            type: Type.STRING,
+            description: "Must be 'low', 'medium', or 'high'",
+          },
+          score: {
+            type: Type.INTEGER,
+            description: "Pressure score integer between 0 and 100",
+          },
+          summary: {
+            type: Type.STRING,
+            description: "Short, neutral assessment explaining the pressure level",
+          },
+          request: {
+            type: Type.STRING,
+            description: "Clear statement of what the sender is asking the recipient to do",
+          },
+          tactics: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                name: {
+                  type: Type.STRING,
+                  description: "Short uppercase or title case name of tactic, e.g. URGENCY, SECRECY, FEAR, EMOTIONAL PRESSURE, AUTHORITY",
+                },
+                explanation: {
+                  type: Type.STRING,
+                  description: "One clear sentence explaining the specific tactic's effect without calling the sender a criminal",
+                },
+              },
+              required: ["name", "explanation"],
             },
+            description: "List of pressure tactics identified. Can be empty for low pressure.",
           },
-          {
-            text: promptText,
+          riskContext: {
+            type: Type.STRING,
+            description: "Why this deserves a second look and why slowing down is beneficial",
           },
+          recommendedAction: {
+            type: Type.STRING,
+            description: "Specific safe next step for the user before acting or replying",
+          },
+          pauseQuestion: {
+            type: Type.STRING,
+            description: "One concise question the user should ask themselves before acting",
+          },
+        },
+        required: [
+          "pressureLevel",
+          "score",
+          "summary",
+          "request",
+          "tactics",
+          "riskContext",
+          "recommendedAction",
+          "pauseQuestion",
         ],
       },
-      config: {
-        systemInstruction,
-        temperature: 0.2,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            pressureLevel: {
-              type: Type.STRING,
-              description: "Must be 'low', 'medium', or 'high'",
-            },
-            score: {
-              type: Type.INTEGER,
-              description: "Pressure score integer between 0 and 100",
-            },
-            summary: {
-              type: Type.STRING,
-              description: "Short, neutral assessment explaining the pressure level",
-            },
-            request: {
-              type: Type.STRING,
-              description: "Clear statement of what the sender is asking the recipient to do",
-            },
-            tactics: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: {
-                    type: Type.STRING,
-                    description: "Short uppercase or title case name of tactic, e.g. URGENCY, SECRECY, FEAR, EMOTIONAL PRESSURE, AUTHORITY",
-                  },
-                  explanation: {
-                    type: Type.STRING,
-                    description: "One clear sentence explaining the specific tactic's effect without calling the sender a criminal",
-                  },
+    };
+
+    let response: any = null;
+    let lastError: any = null;
+
+    for (const modelName of CANDIDATE_MODELS) {
+      try {
+        response = await ai.models.generateContent({
+          model: modelName,
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: mimeType || "image/png",
+                  data: cleanBase64,
                 },
-                required: ["name", "explanation"],
               },
-              description: "List of pressure tactics identified. Can be empty for low pressure.",
-            },
-            riskContext: {
-              type: Type.STRING,
-              description: "Why this deserves a second look and why slowing down is beneficial",
-            },
-            recommendedAction: {
-              type: Type.STRING,
-              description: "Specific safe next step for the user before acting or replying",
-            },
-            pauseQuestion: {
-              type: Type.STRING,
-              description: "One concise question the user should ask themselves before acting",
-            },
+              {
+                text: promptText,
+              },
+            ],
           },
-          required: [
-            "pressureLevel",
-            "score",
-            "summary",
-            "request",
-            "tactics",
-            "riskContext",
-            "recommendedAction",
-            "pauseQuestion",
-          ],
-        },
-      },
-    });
+          config: genConfig,
+        });
+        if (response && response.text) {
+          break;
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`Model ${modelName} failed, trying next candidate:`, msg);
+        lastError = err;
+      }
+    }
+
+    if (!response || !response.text) {
+      throw lastError || new Error("All Gemini models failed to analyze the image.");
+    }
 
     const textOutput = response.text?.trim() || "{}";
     const parsed = JSON.parse(textOutput);
@@ -195,11 +221,13 @@ Evaluate:
     console.error("Error analyzing message with Gemini:", error);
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
 
-    // If quota or API key error, return a fallback so user experience is not broken
-    const fallback = getFallbackAnalysis(req.body?.textHint);
-    return res.json({
-      ...fallback,
-      _note: "Rendered with local safety evaluator due to API limit: " + errorMessage,
+    if (req.body?.textHint) {
+      const fallback = getFallbackAnalysis(req.body.textHint);
+      return res.json(fallback);
+    }
+
+    return res.status(500).json({
+      error: `Analysis service error: ${errorMessage}`,
     });
   }
 });

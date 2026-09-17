@@ -129,7 +129,8 @@ export default function App() {
       });
 
       if (!response.ok) {
-        throw new Error(`Analysis failed with status ${response.status}`);
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `Analysis failed with status ${response.status}`);
       }
 
       const data: AnalysisResult = await response.json();
